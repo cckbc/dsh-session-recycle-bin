@@ -4,8 +4,8 @@
  * Two surfaces, one recycle bin:
  *
  * - one row in `sidebar.workspaces.session.menu.item` — the same list the
- *   shipped Pin / Rename / Fork / Archive rows occupy — whose confirmation
- *   MOVES the session into the Host's recycle bin;
+ *   shipped Pin / Rename / Fork / Archive / Copy Session ID rows occupy — whose
+ *   confirmation MOVES the session into the Host's recycle bin;
  * - one section in `settings.section` listing what the bin holds, with
  *   restore, permanent delete and empty actions, and the retention window.
  *
@@ -58,8 +58,12 @@ window.__ModuleLoader__.load({
     /** Host route implemented by this bundle's Host half. */
     const ENDPOINT = '/plugins/dsh-delete-session/session';
 
-    /** Menu position: after the shipped archive row (order 400). */
-    const MENU_ORDER = 450;
+    /**
+     * Menu position: after the shipped Copy Session ID row (order 450), which
+     * the app keeps last among its own items — the delete row is the last thing
+     * in the menu, and it has to stay there when the app adds another row.
+     */
+    const MENU_ORDER = 500;
 
     /** Settings position: after the shipped Agent presets row (order 20). */
     const SETTINGS_ORDER = 25;
