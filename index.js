@@ -52,7 +52,7 @@ import { readFileSync } from 'node:fs';
 import { existsSync } from 'node:fs';
 import { cp, open, readFile, readdir, mkdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 // The namespace, not a named import: `zstdDecompressSync` only exists from
 // Node 22.15 on, and a named import of an export the runtime does not have is
 // a load-time failure for the whole plugin. Read through the object instead.
@@ -66,6 +66,40 @@ const ROUTE_PATH = '/plugins/dsh-delete-session/session';
 
 /** A session id is an id, never a path: anything else is a malformed request. */
 const SESSION_ID_PATTERN = /^[A-Za-z0-9._-]{1,160}$/;
+
+/**
+ * A directory name the workspace slugger produces: `--` around a body made of
+ * letters, digits, `_`, `-` and the `~XXXX` escapes it writes for everything
+ * else. Nothing in that alphabet can leave the directory it is joined onto.
+ */
+const WORKSPACE_SLUG_PATTERN = /^--[A-Za-z0-9_~-]{1,500}--$/;
+
+/**
+ * Whether a value may be used as ONE path segment.
+ *
+ * `SESSION_ID_PATTERN` alone is not enough: `.` and `..` both match it, and a
+ * value joined into a path as the last segment means the parent directory. The
+ * bin index and the per-entry `meta.json` are files on disk, which is why the
+ * names read back out of them are checked again here rather than trusted.
+ *
+ * @param value - candidate id or directory name.
+ * @returns whether it is a plain segment that cannot climb.
+ */
+function isSafeSegment(value) {
+  return typeof value === 'string' && SESSION_ID_PATTERN.test(value) && !value.includes('..');
+}
+
+/**
+ * Whether a path is inside `<DSH_HOME>/sessions` and not that directory itself.
+ * @param home - DSH home directory.
+ * @param candidate - the path an index entry remembered.
+ * @returns whether a sweep may treat it as a session log.
+ */
+function isInsideSessionsRoot(home, candidate) {
+  const root = resolve(join(home, 'sessions'));
+  const target = resolve(candidate);
+  return target !== root && target.startsWith(root + sep);
+}
 
 /** Largest request body this route buffers. */
 const MAX_BODY_BYTES = 65536;
@@ -380,7 +414,10 @@ function workspaceSlug(cwd) {
 async function findSessionDirectory(home, sessionId) {
   const root = join(home, 'sessions');
   if (!existsSync(root)) return undefined;
-  const candidates = new Set([sessionId, `session-${sessionId}`]);
+  // A candidate that can climb (`..`) is not a session name: joining it would
+  // hand back the parent directory, which is the whole sessions root.
+  const candidates = new Set([sessionId, `session-${sessionId}`].filter((name) => isSafeSegment(name)));
+  if (candidates.size === 0) return undefined;
   let workspaces;
   try {
     workspaces = await readdir(root, { withFileTypes: true });
@@ -867,7 +904,7 @@ async function attachInRunningHost(host, sessionId, cwd) {
 async function missingLogs(home, sessionIds) {
   const wanted = new Set();
   for (const sessionId of Array.isArray(sessionIds) ? sessionIds.slice(0, MAX_VERIFY_IDS) : []) {
-    if (typeof sessionId === 'string' && SESSION_ID_PATTERN.test(sessionId)) wanted.add(sessionId);
+    if (isSafeSegment(sessionId)) wanted.add(sessionId);
   }
   if (wanted.size === 0) return [];
   const root = join(home, 'sessions');
@@ -926,11 +963,20 @@ async function writeIndex(home, index) {
   await rename(temporary, path);
 }
 
-/** One entry's directory name inside the trash root. */
+/**
+ * One entry's directory name inside the trash root.
+ *
+ * `entry.directory` is written by this half, but it is read back out of a file
+ * on disk, so a value that is not one plain segment (a hand-edited `index.json`
+ * carrying `..\\..\\something`) must never reach `rm`. The generated fallback is
+ * the same shape a fresh entry gets: a timestamp and the id, both stripped to
+ * safe characters.
+ */
 function entryDirectoryName(entry) {
-  return typeof entry.directory === 'string' && entry.directory !== ''
-    ? entry.directory
-    : `${String(entry.trashedAt).replaceAll(':', '').replaceAll('.', '')}-${entry.sessionId}`;
+  if (isSafeSegment(entry.directory)) return entry.directory;
+  const stamp = typeof entry.trashedAt === 'string' ? entry.trashedAt : '';
+  const id = String(entry.sessionId ?? '').replace(/[^A-Za-z0-9_-]/g, '_');
+  return `${stamp.replace(/[^A-Za-z0-9_-]/g, '')}-${id}`;
 }
 
 /**
@@ -1032,7 +1078,7 @@ async function repairEntries(home, index) {
       // The payload's own log is the fallback: what was left behind lives in the
       // original directory, which only a deferred move still has.
       const log = await readLogFacts(join(home, TRASH_DIR, entryDirectoryName(entry), 'log'));
-      const source = log.cwd === undefined && typeof entry.originalDirectory === 'string'
+      const source = log.cwd === undefined && typeof entry.originalDirectory === 'string' && isInsideSessionsRoot(home, entry.originalDirectory)
         ? await readLogFacts(entry.originalDirectory)
         : log;
       title = title ?? source.title;
@@ -1189,9 +1235,13 @@ async function settleLeftovers(home, index) {
   let changed = 0;
   for (const entry of index.entries) {
     if (!Array.isArray(entry.leftover) || entry.leftover.length === 0) continue;
-    const original = typeof entry.originalDirectory === 'string' && entry.originalDirectory !== ''
+    // `originalDirectory` is remembered in the bin's own files, so it is only
+    // believed when it still points inside the sessions root; anything else is
+    // looked up again by id.
+    const remembered = typeof entry.originalDirectory === 'string' && entry.originalDirectory !== '' && isInsideSessionsRoot(home, entry.originalDirectory)
       ? entry.originalDirectory
-      : await findSessionDirectory(home, entry.sessionId);
+      : undefined;
+    const original = remembered ?? await findSessionDirectory(home, entry.sessionId);
     if (original === undefined) {
       entry.leftover = [];
       changed += 1;
@@ -1266,15 +1316,28 @@ async function restoreSession(home, sessionId, host) {
   } catch {
     /* the index copy is enough */
   }
-  const slug = typeof meta.workspaceSlug === 'string' && meta.workspaceSlug !== ''
-    ? meta.workspaceSlug
+  /*
+   * Both names are read back out of files in the bin, so neither is trusted:
+   * a slug or a directory name that is not one plain segment would put the
+   * payload (or a copy of it) outside the sessions root. An unusable slug is
+   * rebuilt from the working directory the entry recorded; an unusable name
+   * falls back to the session id, which the route already held to the same
+   * rule.
+   */
+  const storedSlug = typeof meta.workspaceSlug === 'string' && meta.workspaceSlug !== '' ? meta.workspaceSlug : null;
+  const slug = storedSlug !== null && WORKSPACE_SLUG_PATTERN.test(storedSlug)
+    ? storedSlug
     : typeof meta.cwd === 'string' && meta.cwd !== ''
       ? workspaceSlug(meta.cwd)
       : null;
   if (slug === null) {
     throw new TrashError('this entry does not record the workspace it belongs to', 409, 'no-workspace');
   }
-  const name = typeof meta.logDirectoryName === 'string' && meta.logDirectoryName !== '' ? meta.logDirectoryName : sessionId;
+  const storedName = typeof meta.logDirectoryName === 'string' && meta.logDirectoryName !== '' ? meta.logDirectoryName : sessionId;
+  const name = isSafeSegment(storedName) ? storedName : sessionId;
+  if (!isSafeSegment(name)) {
+    throw new TrashError('this entry does not record a usable log directory', 409, 'bad-entry');
+  }
   const target = join(home, 'sessions', slug, name);
   const stamp = new Date().toISOString().replaceAll(':', '').replaceAll('.', '');
   // The workspace directory can be gone if it was never re-created after a move;
@@ -1349,7 +1412,7 @@ async function restoreSession(home, sessionId, host) {
  */
 async function verifiedMissing(home, sessionIds) {
   const asked = Array.isArray(sessionIds)
-    ? sessionIds.slice(0, MAX_VERIFY_IDS).filter((id) => typeof id === 'string' && SESSION_ID_PATTERN.test(id))
+    ? sessionIds.slice(0, MAX_VERIFY_IDS).filter((id) => isSafeSegment(id))
     : [];
   if (asked.length === 0) return [];
   const hidden = new Set(await missingLogs(home, asked));
@@ -1428,7 +1491,7 @@ async function applyAction(home, action, sessionId, request, host) {
     }
     return setRetention(home, days);
   }
-  if (sessionId === '') throw new TrashError('a valid sessionId is required', 400, 'invalid-session');
+  if (!isSafeSegment(sessionId)) throw new TrashError('a valid sessionId is required', 400, 'invalid-session');
   // Deleting is deleting. The Host's archive set is the user's own
   // organisation tool — an archived session stays listed, greyed, until the
   // sidebar filter hides it — so this plugin must NOT touch it: pushing a
@@ -1507,7 +1570,7 @@ export function apply(ctx) {
         // must always be named explicitly.
         const action = typeof payload['action'] === 'string' && payload['action'] !== '' ? payload['action'] : 'list';
         const sessionId = typeof payload['sessionId'] === 'string' ? payload['sessionId'].trim() : '';
-        if (action !== 'list' && action !== 'empty' && action !== 'verify' && action !== 'retention' && !SESSION_ID_PATTERN.test(sessionId)) {
+        if (action !== 'list' && action !== 'empty' && action !== 'verify' && action !== 'retention' && !isSafeSegment(sessionId)) {
           reply(400, { error: 'a valid sessionId is required' });
           return;
         }
